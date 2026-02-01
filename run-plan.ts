@@ -1,72 +1,106 @@
 #!/usr/bin/env npx tsx
 
 /**
- * Automated Plan Executor
+ * Automated Plan Executor using OpenCode SDK + Effect.ts
  *
- * Runs a worker/review loop on a plan file using the Codex SDK.
- * - Worker model implements TODOs one at a time
- * - Reviewer model reviews each completed TODO
+ * Runs a worker/review loop on a plan file using OpenCode.
+ * - Worker agent implements TODOs one at a time
+ * - Reviewer agent reviews each completed TODO
  * - Uses session resumption within a TODO for fix/re-review cycles
- * - Loop continues until all TODOs are done or blocked
  */
 
-import { Codex, Thread } from "@openai/codex-sdk";
+import { createOpencode, type Session } from "@opencode-ai/sdk";
+import { Effect, Console, Option, Data, Match, pipe } from "effect";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-// Configuration
+// ============================================================================
+// Error Types
+// ============================================================================
+
+class PlanNotFoundError extends Data.TaggedError("PlanNotFoundError")<{
+  readonly path: string;
+}> {}
+
+class PromptNotFoundError extends Data.TaggedError("PromptNotFoundError")<{
+  readonly path: string;
+}> {}
+
+class OpenCodeError extends Data.TaggedError("OpenCodeError")<{
+  readonly message: string;
+}> {}
+
+// ============================================================================
+// Domain Types
+// ============================================================================
+
 interface Config {
-  workerModel: string;
-  reviewerModel: string;
-  maxIterationsPerTodo: number;
-  planPath: string;
+  readonly workerModel: string;
+  readonly reviewerModel: string;
+  readonly maxIterationsPerTodo: number;
+  readonly planPath: string;
 }
 
-const DEFAULT_CONFIG: Partial<Config> = {
-  workerModel: "o3",
-  reviewerModel: "o3",
-  maxIterationsPerTodo: 5,
-};
+interface TodoItem {
+  readonly text: string;
+  readonly done: boolean;
+  readonly blocked: boolean;
+  readonly hasReviewFeedback: boolean;
+}
 
-// Prompt paths
+interface PlanState {
+  readonly todos: readonly TodoItem[];
+  readonly allDone: boolean;
+  readonly hasBlocked: boolean;
+  readonly nextTodoIndex: Option.Option<number>;
+}
+
+type TodoResult = "approved" | "blocked" | "max_iterations";
+
+type OpenCodeInstance = Awaited<ReturnType<typeof createOpencode>>;
+
+// ============================================================================
+// Prompt Paths
+// ============================================================================
+
 const PROMPTS = {
   worker: "./commands/worker.md",
   resume: "./commands/resume.md",
   review: "./commands/review.md",
   resumeReview: "./commands/resume-review.md",
+} as const;
+
+// ============================================================================
+// Pure Functions
+// ============================================================================
+
+const parseArgs = (args: readonly string[]): Config => {
+  let workerModel = "anthropic/claude-sonnet-4-20250514";
+  let reviewerModel = "anthropic/claude-sonnet-4-20250514";
+  let maxIterationsPerTodo = 5;
+  let planPath = args[0] ?? "";
+
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === "--worker-model" && args[i + 1]) {
+      workerModel = args[++i];
+    } else if (args[i] === "--reviewer-model" && args[i + 1]) {
+      reviewerModel = args[++i];
+    } else if (args[i] === "--max-iterations-per-todo" && args[i + 1]) {
+      maxIterationsPerTodo = parseInt(args[++i], 10);
+    }
+  }
+
+  // Resolve plan path
+  if (!planPath.includes("/") && !planPath.endsWith(".md")) {
+    planPath = `.plans/${planPath}.md`;
+  }
+  planPath = path.resolve(planPath);
+
+  return { workerModel, reviewerModel, maxIterationsPerTodo, planPath };
 };
 
-function loadPrompt(promptPath: string, planPath: string): string {
-  const fullPath = path.resolve(promptPath);
-  if (!fs.existsSync(fullPath)) {
-    throw new Error(`Prompt file not found: ${fullPath}`);
-  }
-  const template = fs.readFileSync(fullPath, "utf-8");
-  return template.replace("$ARGUMENTS", planPath);
-}
-
-interface TodoItem {
-  text: string;
-  done: boolean;
-  blocked: boolean;
-  hasReviewFeedback: boolean;
-}
-
-interface PlanState {
-  todos: TodoItem[];
-  allDone: boolean;
-  hasBlocked: boolean;
-  nextTodoIndex: number;
-}
-
-function parsePlan(planPath: string): PlanState {
-  if (!fs.existsSync(planPath)) {
-    throw new Error(`Plan file not found: ${planPath}`);
-  }
-
-  const content = fs.readFileSync(planPath, "utf-8");
+const parsePlanContent = (content: string): PlanState => {
   const lines = content.split("\n");
-
   const todos: TodoItem[] = [];
   let inTodoSection = false;
   let currentTodo: TodoItem | null = null;
@@ -110,8 +144,16 @@ function parsePlan(planPath: string): PlanState {
             hasReviewFeedback: false,
           };
         }
-      } else if (currentTodo && line.includes("review: status=request_changes")) {
-        currentTodo.hasReviewFeedback = true;
+      } else if (
+        currentTodo !== null &&
+        line.includes("review: status=request_changes")
+      ) {
+        currentTodo = {
+          text: currentTodo.text,
+          done: currentTodo.done,
+          blocked: currentTodo.blocked,
+          hasReviewFeedback: true,
+        };
       }
     }
   }
@@ -121,220 +163,295 @@ function parsePlan(planPath: string): PlanState {
   const allDone = todos.length > 0 && todos.every((t) => t.done);
   const hasBlocked = todos.some((t) => t.blocked);
 
-  // Find next unchecked, non-blocked TODO
-  let nextTodoIndex = -1;
+  let nextTodoIndex: Option.Option<number> = Option.none();
   for (let i = 0; i < todos.length; i++) {
     if (!todos[i].done && !todos[i].blocked) {
-      nextTodoIndex = i;
+      nextTodoIndex = Option.some(i);
       break;
     }
   }
 
   return { todos, allDone, hasBlocked, nextTodoIndex };
-}
+};
 
-async function runThread(
-  thread: Thread,
+// ============================================================================
+// Effectful Operations
+// ============================================================================
+
+const readFile = (filePath: string) =>
+  Effect.try({
+    try: () => fs.readFileSync(filePath, "utf-8"),
+    catch: () => new PlanNotFoundError({ path: filePath }),
+  });
+
+const loadPrompt = (promptPath: string, planPath: string) =>
+  pipe(
+    Effect.try({
+      try: () => fs.readFileSync(path.resolve(promptPath), "utf-8"),
+      catch: () => new PromptNotFoundError({ path: promptPath }),
+    }),
+    Effect.map((template) => template.replace("$ARGUMENTS", planPath))
+  );
+
+const parsePlan = (planPath: string) =>
+  pipe(
+    readFile(planPath),
+    Effect.map(parsePlanContent),
+    Effect.mapError(() => new PlanNotFoundError({ path: planPath }))
+  );
+
+const logHeader = (char: string, message: string) =>
+  Console.log(`\n${char.repeat(60)}\n${message}\n${char.repeat(60)}`);
+
+const logStatus = (state: PlanState) =>
+  Effect.all([
+    Console.log(`📝 Found ${state.todos.length} TODOs`),
+    Console.log(`   ✓ Done: ${state.todos.filter((t) => t.done).length}`),
+    Console.log(
+      `   ○ Pending: ${state.todos.filter((t) => !t.done && !t.blocked).length}`
+    ),
+    Console.log(
+      `   ⊘ Blocked: ${state.todos.filter((t) => t.blocked).length}`
+    ),
+  ]);
+
+// ============================================================================
+// OpenCode Session Management
+// ============================================================================
+
+const createSession = (
+  instance: OpenCodeInstance
+): Effect.Effect<Session, OpenCodeError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const result = await instance.client.session.create();
+      if (result.error) {
+        throw new Error(`Session create failed: ${JSON.stringify(result.error)}`);
+      }
+      return result.data!;
+    },
+    catch: (e) =>
+      new OpenCodeError({ message: `Failed to create session: ${e}` }),
+  });
+
+const sendPrompt = (
+  instance: OpenCodeInstance,
+  sessionId: string,
   prompt: string,
   role: string
-): Promise<string> {
-  console.log(`\n${"─".repeat(60)}`);
-  console.log(`🤖 ${role}`);
-  console.log(`${"─".repeat(60)}\n`);
+): Effect.Effect<void, OpenCodeError> =>
+  Effect.gen(function* () {
+    yield* Console.log(`\n${"─".repeat(60)}`);
+    yield* Console.log(`🤖 ${role}`);
+    yield* Console.log(`${"─".repeat(60)}\n`);
 
-  let output = "";
+    const result = yield* Effect.tryPromise({
+      try: async () => {
+        const response = await instance.client.session.prompt({
+          path: { id: sessionId },
+          body: {
+            parts: [{ type: "text", text: prompt }],
+          },
+        });
+        return response;
+      },
+      catch: (e) =>
+        new OpenCodeError({ message: `Failed to send prompt: ${e}` }),
+    });
 
-  for await (const event of thread.runStreamed(prompt)) {
-    if (event.type === "message") {
-      const content = event.message?.content;
-      if (typeof content === "string") {
-        process.stdout.write(content);
-        output += content;
-      } else if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part.type === "text") {
-            process.stdout.write(part.text);
-            output += part.text;
-          }
+    // Extract and display text content from response parts
+    if (result.data && "parts" in result.data && Array.isArray(result.data.parts)) {
+      for (const part of result.data.parts) {
+        if (part.type === "text" && "text" in part) {
+          process.stdout.write(String(part.text));
         }
       }
     }
-  }
 
-  console.log("\n");
-  return output;
-}
+    yield* Console.log("\n");
+  });
 
-async function processTodo(
-  workerCodex: Codex,
-  reviewerCodex: Codex,
+// ============================================================================
+// Todo Processor
+// ============================================================================
+
+const processTodo = (
+  instance: OpenCodeInstance,
   config: Config,
   todoIndex: number,
   todoText: string,
   hasExistingFeedback: boolean
-): Promise<"approved" | "blocked" | "max_iterations"> {
-  console.log(`\n${"═".repeat(60)}`);
-  console.log(`📌 TODO #${todoIndex + 1}: ${todoText}`);
-  console.log(`${"═".repeat(60)}`);
+): Effect.Effect<
+  TodoResult,
+  PlanNotFoundError | PromptNotFoundError | OpenCodeError
+> =>
+  Effect.gen(function* () {
+    yield* logHeader("═", `📌 TODO #${todoIndex + 1}: ${todoText}`);
 
-  // Start fresh sessions for this TODO
-  let workerThread = workerCodex.startThread({ model: config.workerModel });
-  let reviewerThread = reviewerCodex.startThread({ model: config.reviewerModel });
+    // Create fresh sessions for this TODO
+    const workerSession = yield* createSession(instance);
+    const reviewerSession = yield* createSession(instance);
 
-  let iteration = 0;
-  let isFirstWorkerRun = true;
-  let isFirstReviewRun = true;
+    const workerSessionId = workerSession.id;
+    const reviewerSessionId = reviewerSession.id;
 
-  while (iteration < config.maxIterationsPerTodo) {
-    iteration++;
-    console.log(`\n>>> Iteration ${iteration}/${config.maxIterationsPerTodo}`);
+    let isFirstWorkerRun = true;
+    let isFirstReviewRun = true;
 
-    // Get current state
-    const stateBefore = parsePlan(config.planPath);
+    for (
+      let iteration = 1;
+      iteration <= config.maxIterationsPerTodo;
+      iteration++
+    ) {
+      yield* Console.log(
+        `\n>>> Iteration ${iteration}/${config.maxIterationsPerTodo}`
+      );
 
-    // Check if blocked
-    if (stateBefore.hasBlocked) {
-      return "blocked";
-    }
+      const stateBefore = yield* parsePlan(config.planPath);
 
-    // Determine which worker prompt to use
-    const currentTodo = stateBefore.todos[todoIndex];
-    const needsResume = !isFirstWorkerRun || (hasExistingFeedback && isFirstWorkerRun);
-
-    if (!currentTodo.done) {
-      // Run worker
-      const workerPrompt = needsResume
-        ? loadPrompt(PROMPTS.resume, config.planPath)
-        : loadPrompt(PROMPTS.worker, config.planPath);
-
-      const workerRole = needsResume
-        ? `Worker: Resume Session (fixing review feedback)`
-        : `Worker: New Session (implementing TODO)`;
-
-      await runThread(workerThread, workerPrompt, workerRole);
-      isFirstWorkerRun = false;
-
-      // Check result
-      const afterWorker = parsePlan(config.planPath);
-
-      if (afterWorker.hasBlocked) {
-        console.log("\n⚠️  Worker blocked. Stopping.");
-        return "blocked";
+      // Check if blocked
+      if (stateBefore.hasBlocked) {
+        return "blocked" as TodoResult;
       }
 
-      if (!afterWorker.todos[todoIndex]?.done) {
-        console.log("\n⚠️  Worker did not complete TODO. Stopping.");
-        return "blocked";
+      const currentTodo = stateBefore.todos[todoIndex];
+      const needsResume =
+        !isFirstWorkerRun || (hasExistingFeedback && isFirstWorkerRun);
+
+      // Run worker if TODO not done
+      if (!currentTodo?.done) {
+        const workerPromptPath = needsResume ? PROMPTS.resume : PROMPTS.worker;
+        const workerPrompt = yield* loadPrompt(
+          workerPromptPath,
+          config.planPath
+        );
+
+        const workerRole = needsResume
+          ? `Worker: Resume Session (fixing review feedback)`
+          : `Worker: New Session (implementing TODO)`;
+
+        yield* sendPrompt(instance, workerSessionId, workerPrompt, workerRole);
+        isFirstWorkerRun = false;
+
+        // Check worker result
+        const afterWorker = yield* parsePlan(config.planPath);
+
+        if (afterWorker.hasBlocked) {
+          yield* Console.log("\n⚠️  Worker blocked. Stopping.");
+          return "blocked" as TodoResult;
+        }
+
+        if (!afterWorker.todos[todoIndex]?.done) {
+          yield* Console.log("\n⚠️  Worker did not complete TODO. Stopping.");
+          return "blocked" as TodoResult;
+        }
       }
+
+      // Run reviewer
+      const reviewPromptPath = isFirstReviewRun
+        ? PROMPTS.review
+        : PROMPTS.resumeReview;
+      const reviewPrompt = yield* loadPrompt(reviewPromptPath, config.planPath);
+
+      const reviewRole = isFirstReviewRun
+        ? `Reviewer: New Session (initial review)`
+        : `Reviewer: Resume Session (re-reviewing after fixes)`;
+
+      yield* sendPrompt(
+        instance,
+        reviewerSessionId,
+        reviewPrompt,
+        reviewRole
+      );
+      isFirstReviewRun = false;
+
+      // Check review result
+      const afterReview = yield* parsePlan(config.planPath);
+
+      if (afterReview.todos[todoIndex]?.done) {
+        yield* Console.log("\n✅ TODO approved by reviewer!");
+        return "approved" as TodoResult;
+      }
+
+      yield* Console.log("\n🔄 Reviewer requested changes. Continuing...");
     }
 
-    // Run reviewer
-    const reviewPrompt = isFirstReviewRun
-      ? loadPrompt(PROMPTS.review, config.planPath)
-      : loadPrompt(PROMPTS.resumeReview, config.planPath);
+    yield* Console.log(
+      `\n⚠️  Max iterations (${config.maxIterationsPerTodo}) reached for this TODO.`
+    );
+    return "max_iterations" as TodoResult;
+  });
 
-    const reviewRole = isFirstReviewRun
-      ? `Reviewer: New Session (initial review)`
-      : `Reviewer: Resume Session (re-reviewing after fixes)`;
+// ============================================================================
+// Main Program
+// ============================================================================
 
-    await runThread(reviewerThread, reviewPrompt, reviewRole);
-    isFirstReviewRun = false;
-
-    // Check review result
-    const afterReview = parsePlan(config.planPath);
-
-    if (afterReview.todos[todoIndex]?.done) {
-      console.log("\n✅ TODO approved by reviewer!");
-      return "approved";
-    }
-
-    // Reviewer requested changes - loop continues
-    console.log("\n🔄 Reviewer requested changes. Continuing...");
-  }
-
-  console.log(`\n⚠️  Max iterations (${config.maxIterationsPerTodo}) reached for this TODO.`);
-  return "max_iterations";
-}
-
-async function main() {
+const program: Effect.Effect<
+  void,
+  PlanNotFoundError | PromptNotFoundError | OpenCodeError
+> = Effect.gen(function* () {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    console.error("Usage: npx tsx run-plan.ts <plan-path> [options]");
-    console.error("");
-    console.error("Options:");
-    console.error("  --worker-model <model>         Model for worker (default: o3)");
-    console.error("  --reviewer-model <model>       Model for reviewer (default: o3)");
-    console.error("  --max-iterations-per-todo <n>  Max fix/review cycles per TODO (default: 5)");
-    process.exit(1);
+    yield* Console.log("Usage: npx tsx run-plan.ts <plan-path> [options]");
+    yield* Console.log("");
+    yield* Console.log("Options:");
+    yield* Console.log(
+      "  --worker-model <model>         Model for worker (default: anthropic/claude-sonnet-4-20250514)"
+    );
+    yield* Console.log(
+      "  --reviewer-model <model>       Model for reviewer (default: anthropic/claude-sonnet-4-20250514)"
+    );
+    yield* Console.log(
+      "  --max-iterations-per-todo <n>  Max fix/review cycles (default: 5)"
+    );
+    return;
   }
 
-  // Parse arguments
-  const config: Config = {
-    ...DEFAULT_CONFIG,
-    planPath: args[0],
-  } as Config;
+  const config = parseArgs(args);
 
-  for (let i = 1; i < args.length; i++) {
-    if (args[i] === "--worker-model" && args[i + 1]) {
-      config.workerModel = args[++i];
-    } else if (args[i] === "--reviewer-model" && args[i + 1]) {
-      config.reviewerModel = args[++i];
-    } else if (args[i] === "--max-iterations-per-todo" && args[i + 1]) {
-      config.maxIterationsPerTodo = parseInt(args[++i], 10);
-    }
-  }
-
-  // Resolve plan path
-  if (!config.planPath.includes("/") && !config.planPath.endsWith(".md")) {
-    config.planPath = `.plans/${config.planPath}.md`;
-  }
-  config.planPath = path.resolve(config.planPath);
-
-  console.log("📋 Plan Executor");
-  console.log(`   Plan: ${config.planPath}`);
-  console.log(`   Worker Model: ${config.workerModel}`);
-  console.log(`   Reviewer Model: ${config.reviewerModel}`);
-  console.log(`   Max Iterations Per TODO: ${config.maxIterationsPerTodo}`);
-  console.log("");
-
-  // Validate plan exists
-  const initialState = parsePlan(config.planPath);
-  console.log(`📝 Found ${initialState.todos.length} TODOs`);
-  console.log(
-    `   ✓ Done: ${initialState.todos.filter((t) => t.done).length}`
+  yield* Console.log("📋 Plan Executor (OpenCode SDK)");
+  yield* Console.log(`   Plan: ${config.planPath}`);
+  yield* Console.log(`   Worker Model: ${config.workerModel}`);
+  yield* Console.log(`   Reviewer Model: ${config.reviewerModel}`);
+  yield* Console.log(
+    `   Max Iterations Per TODO: ${config.maxIterationsPerTodo}`
   );
-  console.log(
-    `   ○ Pending: ${initialState.todos.filter((t) => !t.done && !t.blocked).length}`
-  );
-  console.log(
-    `   ⊘ Blocked: ${initialState.todos.filter((t) => t.blocked).length}`
-  );
+  yield* Console.log("");
+
+  const initialState = yield* parsePlan(config.planPath);
+  yield* logStatus(initialState);
 
   if (initialState.allDone) {
-    console.log("\n✅ All TODOs are already complete!");
-    process.exit(0);
+    yield* Console.log("\n✅ All TODOs are already complete!");
+    return;
   }
 
   if (initialState.hasBlocked) {
-    console.log("\n⚠️  Plan has blocked TODOs. Resolve them first.");
-    process.exit(1);
+    yield* Console.log("\n⚠️  Plan has blocked TODOs. Resolve them first.");
+    return;
   }
 
-  // Initialize Codex clients
-  const workerCodex = new Codex();
-  const reviewerCodex = new Codex();
+  // Initialize OpenCode
+  yield* Console.log("\n🚀 Starting OpenCode server...");
+  const instance = yield* Effect.tryPromise({
+    try: () => createOpencode(),
+    catch: (e) =>
+      new OpenCodeError({ message: `Failed to start OpenCode: ${e}` }),
+  });
+
+  yield* Console.log("✓ OpenCode ready\n");
 
   // Process TODOs
-  let todoIndex = initialState.nextTodoIndex;
+  let currentIndex = initialState.nextTodoIndex;
 
-  while (todoIndex !== -1) {
-    const state = parsePlan(config.planPath);
+  while (Option.isSome(currentIndex)) {
+    const todoIndex = currentIndex.value;
+    const state = yield* parsePlan(config.planPath);
     const todo = state.todos[todoIndex];
 
-    const result = await processTodo(
-      workerCodex,
-      reviewerCodex,
+    const result = yield* processTodo(
+      instance,
       config,
       todoIndex,
       todo.text,
@@ -342,40 +459,66 @@ async function main() {
     );
 
     if (result === "blocked") {
-      console.log("\n🛑 Execution stopped: TODO blocked.");
+      yield* Console.log("\n🛑 Execution stopped: TODO blocked.");
       break;
     }
 
     if (result === "max_iterations") {
-      console.log("\n🛑 Execution stopped: Max iterations reached on a TODO.");
+      yield* Console.log("\n🛑 Execution stopped: Max iterations reached.");
       break;
     }
 
-    // Find next TODO
-    const nextState = parsePlan(config.planPath);
-    todoIndex = nextState.nextTodoIndex;
+    const nextState = yield* parsePlan(config.planPath);
 
     if (nextState.allDone) {
       break;
     }
+
+    currentIndex = nextState.nextTodoIndex;
   }
 
   // Final status
-  const finalState = parsePlan(config.planPath);
-  console.log("\n" + "═".repeat(60));
-  console.log("📊 Final Status");
-  console.log("═".repeat(60));
-  console.log(`   Total TODOs: ${finalState.todos.length}`);
-  console.log(`   ✓ Completed: ${finalState.todos.filter((t) => t.done).length}`);
-  console.log(`   ○ Pending: ${finalState.todos.filter((t) => !t.done && !t.blocked).length}`);
-  console.log(`   ⊘ Blocked: ${finalState.todos.filter((t) => t.blocked).length}`);
+  const finalState = yield* parsePlan(config.planPath);
+  yield* logHeader("═", "📊 Final Status");
+  yield* Console.log(`   Total TODOs: ${finalState.todos.length}`);
+  yield* Console.log(
+    `   ✓ Completed: ${finalState.todos.filter((t) => t.done).length}`
+  );
+  yield* Console.log(
+    `   ○ Pending: ${finalState.todos.filter((t) => !t.done && !t.blocked).length}`
+  );
+  yield* Console.log(
+    `   ⊘ Blocked: ${finalState.todos.filter((t) => t.blocked).length}`
+  );
 
   if (finalState.allDone) {
-    console.log("\n🎉 All TODOs complete!");
+    yield* Console.log("\n🎉 All TODOs complete!");
   }
-}
+});
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
+// ============================================================================
+// Run
+// ============================================================================
+
+Effect.runPromise(
+  pipe(
+    program,
+    Effect.catchAll((error) =>
+      Match.value(error).pipe(
+        Match.tag("PlanNotFoundError", (e) =>
+          Console.error(`❌ Plan not found: ${e.path}`)
+        ),
+        Match.tag("PromptNotFoundError", (e) =>
+          Console.error(`❌ Prompt not found: ${e.path}`)
+        ),
+        Match.tag("OpenCodeError", (e) =>
+          Console.error(`❌ OpenCode error: ${e.message}`)
+        ),
+        Match.exhaustive
+      )
+    )
+  )
+).catch((e) => {
+  console.error("Fatal error:", e);
   process.exit(1);
 });
