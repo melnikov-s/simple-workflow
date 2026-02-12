@@ -28,7 +28,7 @@ Open the plan file and work through every unchecked TODO (`- [ ] ...`) in order,
 
 ### 2a. Implementation (Sub-Agent)
 
-Launch a sub-agent to implement the TODO. **Pass the sub-agent the full contents of the plan file** (read and include the entire file in the sub-agent prompt) so it has complete context — objective, scope, constraints, architecture notes, implementation notes, and all prior progress.
+Launch a sub-agent to implement the TODO. **Pass the sub-agent the plan file path** and instruct it to read the file first so it has complete context — objective, scope, constraints, architecture notes, implementation notes, and all prior progress.
 
 The sub-agent must follow the complete-todo workflow:
 
@@ -44,7 +44,7 @@ The sub-agent must follow the complete-todo workflow:
 
 If `MAX_REVIEW_ITERATIONS > 0`, run up to `MAX_REVIEW_ITERATIONS` review cycles:
 
-**Review sub-agent:** Pass the sub-agent the full contents of the plan file (re-read it first to capture any updates from the implementation sub-agent).
+**Review sub-agent:** Pass the sub-agent the plan file path and instruct it to read the file first (it will capture any updates from the implementation sub-agent).
 - Review the most recently completed TODO following the review workflow.
 - Read the commit diff with `git show`.
 - Evaluate against the plan's objective, success criteria, and review focus.
@@ -54,7 +54,7 @@ If `MAX_REVIEW_ITERATIONS > 0`, run up to `MAX_REVIEW_ITERATIONS` review cycles:
 
 **If approved:** Stop the review loop for this TODO and move to the next TODO.
 
-**If changes requested:** Launch a new implementation sub-agent to fix the issues. Pass it the full contents of the plan file (re-read it first). This sub-agent must:
+**If changes requested:** Launch a new implementation sub-agent to fix the issues. Pass it the plan file path and instruct it to read the file first. This sub-agent must:
 - Read the review annotations under the TODO.
 - Fix the issues.
 - Use `git commit --amend` (not a new commit).

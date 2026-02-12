@@ -1,6 +1,7 @@
 ---
 description: Creates or initializes a structured plan file for a coding task, defining objectives, scope, and a checklist of atomic TODOs.
 ---
+
 # /plan
 
 You are helping a software engineer plan a coding task.
@@ -16,7 +17,7 @@ $ARGUMENTS
 
 The argument should be a plan name (e.g., `add-auth`).
 
-If the plan name is missing, stop and ask the user for a name.
+If the plan name is missing, infer it from context if a plan has already been worked on in this conversation. Otherwise, stop and ask the user for a name.
 
 The plan file will be saved to `.plans/<name>.md` (e.g., `.plans/add-auth.md`).
 
@@ -24,31 +25,37 @@ Create the `.plans/` directory if it doesn't exist.
 
 ## Your Job
 
-1. Read (or create) the plan file.
-2. Explore the repo as needed to understand context and constraints.
-3. Interview the user until the plan is fully specified (see Interview Process below).
-4. Write a high-quality plan with a checklist where each TODO is exactly ONE commit.
+Follow this sequence strictly:
+
+1. **Get the plan name.** If not provided, infer from context if a plan has been worked on in this conversation; otherwise ask for it. Do nothing else until you have it.
+2. **Get the task description.** Ask the user to describe what needs to be done.
+3. **Explore the repo.** Now that you know what the user wants, explore to understand context, constraints, and relevant code.
+4. **Ask clarifying questions.** Interview the user until the plan is fully specified (see Interview Process below).
+5. **Write the plan.** Create a high-quality plan with a checklist where each TODO is exactly ONE commit.
+
+**Do NOT explore the repo or draft plan content until the user has described the task.**
 
 ## Interview Process
 
 Your goal is a plan that can be implemented end-to-end with no open questions or underspecified details.
 
+**Ask one question at a time.** Do not dump a list of questions. Each response should contain a single clarifying question, then wait for the answer before asking the next one. This keeps the conversation focused and avoids overwhelming the user.
+
+When asking a question, you may offer a recommendation (e.g., "I'd recommend X because Y—does that work?").
+
 **Keep interviewing until you can confidently say:**
+
 - Every TODO is unambiguous—a developer could implement it without guessing intent
 - Edge cases and error handling expectations are clear
 - Success criteria are concrete and testable
 - No critical decisions are left undefined
 
-**In each round:**
-1. Ask clarifying questions about gaps or ambiguities you've identified
-2. Offer recommendations or suggestions where you have opinions (e.g., "I'd recommend X because Y—does that work?")
-3. Summarize your current understanding to confirm alignment
-
 **Stop interviewing when:**
+
 - The user explicitly says they're satisfied, OR
 - You have enough detail that `## Open Questions` would be empty
 
-Do NOT artificially limit yourself to a fixed number of questions. A simple task may need zero; a complex one may need many rounds.
+Do NOT artificially limit yourself to a fixed number of questions. A simple task may need one; a complex one may need many rounds.
 
 ## Plan Format
 
@@ -112,7 +119,7 @@ If the file does not exist, create it with this skeleton and then fill it in.
 - Each TODO item is a single, reviewable commit.
 - Use `- [ ] ...` checkboxes.
 - Prefer concrete verbs (Add/Fix/Refactor) and include the scope in the TODO text.
-- Avoid TODOs that are just “run tests” or “investigate”.
+- **Keep TODOs chunky, not atomic.** A medium task should have 2–4 TODOs, not 10. Group related changes into one TODO rather than splitting every small step.
 
 ## Stop Condition
 

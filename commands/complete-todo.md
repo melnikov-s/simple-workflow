@@ -1,7 +1,8 @@
 ---
 description: Implements the next available TODO item from a plan, creating a single commit and updating the plan with progress.
 ---
-# /worker
+
+# /complete-todo
 
 You are implementing exactly ONE TODO item from a plan and creating exactly ONE commit.
 
@@ -11,7 +12,7 @@ You are BUILDING, not planning.
 
 $ARGUMENTS
 
-If the plan file path is missing, stop and ask the user for the plan path.
+If the plan file path is missing, infer it from context if a plan has already been worked on in this conversation. Otherwise, stop and ask the user for the plan path.
 
 If the plan path begins with `@` (example: `@plan.md`), open the file at the path without the leading `@`.
 
@@ -66,12 +67,14 @@ If you encounter ambiguity or insufficient specification that would require you 
 5. Stop.
 
 **Block when:**
+
 - Requirements are vague or contradictory
 - Multiple valid interpretations exist with no clear winner
 - Missing information that significantly affects implementation
 - Architectural decisions that should involve the user
 
 **Do NOT block when:**
+
 - Minor stylistic choices you can reasonably make
 - Implementation details with obvious defaults
 - Things you can verify with tests

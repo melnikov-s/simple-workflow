@@ -12,14 +12,15 @@ You are BUILDING, not planning.
 
 $ARGUMENTS
 
-If the plan file path is missing, stop and ask the user for the plan path.
+If the plan file path is missing, infer it from context if a plan has already been worked on in this conversation. Otherwise, stop and ask the user for the plan path.
 
 If the plan path begins with `@` (example: `@plan.md`), open the file at the path without the leading `@`.
 
 ## Context
 
 This command is used after:
-1. `/worker` implemented a TODO and committed
+
+1. `/complete-todo` implemented a TODO and committed
 2. `/review` reviewed it and requested changes (unchecked the TODO, added feedback)
 
 You are picking up where that cycle left off.
@@ -44,7 +45,7 @@ You are picking up where that cycle left off.
    - Append a bullet to `## Progress Log` noting you addressed review feedback.
 7. Stop.
 
-## Key Differences From /worker
+## Key Differences From /complete-todo
 
 - You already have review feedback to guide you—read it carefully.
 - You amend the existing commit rather than creating a new one.

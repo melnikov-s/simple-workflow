@@ -15,7 +15,7 @@ You are FINISHING, not building.
 
 $ARGUMENTS
 
-If the plan file path is missing, stop and ask the user for the plan path.
+If the plan file path is missing, infer it from context if a plan has already been worked on in this conversation. Otherwise, stop and ask the user for the plan path.
 
 ## Pre-Flight Check
 
